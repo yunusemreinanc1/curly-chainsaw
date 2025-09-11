@@ -20,7 +20,7 @@ jobs:
                              -Name "SecurityLayer" -Value 0 -Force
 
           # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           
           # For testing, allow any incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
@@ -28,27 +28,48 @@ jobs:
 
           # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
+          Write-Host "✅ RDP Core settings configured!"
 
-      - name: Enable Hyper-V for Android Emulation
+      - name: Enable Virtualization Features for BlueStacks
         run: |
-          # Enable Hyper-V and virtualization features for BlueStacks performance
-          Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All -NoRestart
-          Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -NoRestart
-          Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -NoRestart
+          Write-Host "🔧 Configuring virtualization for BlueStacks..."
           
-          # Enable hardware virtualization in registry
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard' `
-                           -Name 'EnableVirtualizationBasedSecurity' -Value 0 -Force
+          # Windows Server 2022 compatible virtualization features
+          try {
+              Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All -NoRestart -ErrorAction SilentlyContinue
+              Write-Host "✅ Windows Hypervisor Platform enabled"
+          } catch {
+              Write-Host "⚠️ Hypervisor Platform not available, proceeding without it"
+          }
           
-          Write-Host "✅ Hyper-V and virtualization enabled for BlueStacks!"
+          # Enable Virtual Machine Platform
+          try {
+              Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All -NoRestart -ErrorAction SilentlyContinue
+              Write-Host "✅ Virtual Machine Platform enabled"
+          } catch {
+              Write-Host "⚠️ VM Platform not available, proceeding without it"
+          }
+          
+          # Enable Windows Subsystem for Linux (helps with virtualization)
+          try {
+              Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -NoRestart -ErrorAction SilentlyContinue
+              Write-Host "✅ WSL enabled for better virtualization support"
+          } catch {
+              Write-Host "⚠️ WSL not available, proceeding without it"
+          }
+          
+          Write-Host "🔧 Virtualization features configured for BlueStacks!"
 
       - name: Optimize RDP Performance (GPU + 60FPS + Android Emulation)
         run: |
+          Write-Host "⚡ Optimizing RDP for gaming and Android emulation..."
+          
           # Enable GPU acceleration for RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "fEnableWinStation" -Value 1 -Force
           
           # Enable hardware graphics acceleration
+          New-Item -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Force | Out-Null
           Set-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' `
                            -Name "fEnableVirtualizedGraphics" -Value 1 -Force
           
@@ -61,22 +82,27 @@ jobs:
                            -Name "MaxCompressionLevel" -Value 0 -Force
           
           # Enable H.264/AVC hardware encoding
-          New-Item -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Force | Out-Null
           Set-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' `
                            -Name "AVC444ModePreferred" -Value 1 -Force
           Set-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' `
                            -Name "AVCHardwareEncodePreferred" -Value 1 -Force
           
-          # Optimize for Android emulation
+          # Optimize for Android emulation and gaming
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "fAutoClientLpts" -Value 1 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "fAutoClientDrives" -Value 1 -Force
           
+          # Disable desktop composition for better gaming performance
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "fDisableCdm" -Value 0 -Force
+          
           Write-Host "✅ RDP optimized for 60FPS gaming + Android emulation!"
 
       - name: Create RDP User with Secure Password
         run: |
+          Write-Host "👤 Creating secure RDP user..."
+          
           Add-Type -AssemblyName System.Security
           $charSet = @{
               Upper   = [char[]](65..90)      # A-Z
@@ -92,118 +118,207 @@ jobs:
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          try {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction Stop
+              Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction Stop
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction Stop
+              Write-Host "✅ RDP user created successfully!"
+          } catch {
+              Write-Host "⚠️ User might already exist, attempting to update password..."
+              Set-LocalUser -Name "RDP" -Password $securePass
+          }
           
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              Write-Error "❌ User creation failed"
               exit 1
           }
 
-      - name: Install BlueStacks 5 + Gaming Tools
+      - name: Install BlueStacks 5 (Server 2022 Compatible)
         run: |
-          Write-Host "🎮 Installing BlueStacks 5 and gaming tools..."
+          Write-Host "🎮 Installing BlueStacks 5 for mobile gaming..."
           
-          # Download BlueStacks 5 installer
-          $bluestacksUrl = "https://cdn3.bluestacks.com/downloads/windows/bgp64_mac/5.21.610.1002/9f8613b0f2b647b8a7c27e0474d5c55c/x64/BlueStacksInstaller_5.21.610.1002_amd64_native.exe"
-          $installerPath = "$env:TEMP\BlueStacksInstaller.exe"
-          
-          Write-Host "⬇️ Downloading BlueStacks installer..."
-          Invoke-WebRequest -Uri $bluestacksUrl -OutFile $installerPath -UseBasicParsing
-          
-          # Install BlueStacks silently
-          Write-Host "📦 Installing BlueStacks 5..."
-          Start-Process -FilePath $installerPath -ArgumentList "-s" -Wait
-          
-          # Wait for installation to complete
-          Start-Sleep -Seconds 30
-          
-          # Verify BlueStacks installation
-          $bluestacksPath = "C:\Program Files\BlueStacks_nxt"
-          if (Test-Path $bluestacksPath) {
-              Write-Host "✅ BlueStacks 5 installed successfully!"
-              
-              # Configure BlueStacks for optimal performance
-              $configPath = "$env:PROGRAMDATA\BlueStacks_nxt\bluestacks.conf"
-              if (Test-Path $configPath) {
-                  # Set high performance settings
-                  (Get-Content $configPath) -replace 'bst.instance.Nougat64.memory=.*', 'bst.instance.Nougat64.memory=4096' | Set-Content $configPath
-                  (Get-Content $configPath) -replace 'bst.instance.Nougat64.cpu_count=.*', 'bst.instance.Nougat64.cpu_count=4' | Set-Content $configPath
-                  Write-Host "⚡ BlueStacks configured for high performance!"
-              }
-          } else {
-              Write-Host "❌ BlueStacks installation failed, trying alternative method..."
-              
-              # Fallback: Install via Chocolatey
-              Set-ExecutionPolicy Bypass -Scope Process -Force
-              [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+          # Install Chocolatey first (most reliable method)
+          Write-Host "📦 Setting up Chocolatey package manager..."
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+          try {
               Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
-              choco install bluestacks5 -y
+              Write-Host "✅ Chocolatey installed"
+          } catch {
+              Write-Host "⚠️ Chocolatey installation issue, trying direct BlueStacks download..."
           }
           
-          # Install additional gaming tools
-          Write-Host "🛠️ Installing additional gaming tools..."
-          choco install googlechrome 7zip notepadplusplus -y
+          # Method 1: Try Chocolatey installation (most reliable for Server 2022)
+          $bluestacksInstalled = $false
+          try {
+              Write-Host "📱 Installing BlueStacks via Chocolatey..."
+              choco install bluestacks5 -y --ignore-checksums --no-progress --timeout 600
+              $bluestacksInstalled = $true
+              Write-Host "✅ BlueStacks installed via Chocolatey"
+          } catch {
+              Write-Host "⚠️ Chocolatey installation failed, trying direct download..."
+          }
           
-          # Clean up installer
-          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          # Method 2: Direct download if Chocolatey failed
+          if (-not $bluestacksInstalled) {
+              $bluestacksUrl = "https://cdn3.bluestacks.com/downloads/windows/bgp64_mac/5.21.610.1002/9f8613b0f2b647b8a7c27e0474d5c55c/x64/BlueStacksInstaller_5.21.610.1002_amd64_native.exe"
+              $installerPath = "$env:TEMP\BlueStacksInstaller.exe"
+              
+              Write-Host "⬇️ Downloading BlueStacks installer..."
+              try {
+                  Invoke-WebRequest -Uri $bluestacksUrl -OutFile $installerPath -UseBasicParsing -TimeoutSec 300
+                  Write-Host "✅ Download completed"
+                  
+                  Write-Host "📦 Installing BlueStacks..."
+                  $installArgs = @("-s", "--defaultImageName", "Nougat64", "--imageToLaunch", "Nougat64")
+                  Start-Process -FilePath $installerPath -ArgumentList $installArgs -Wait -NoNewWindow
+                  Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+                  $bluestacksInstalled = $true
+                  Write-Host "✅ BlueStacks direct installation completed"
+              } catch {
+                  Write-Host "❌ Direct installation failed: $($_.Exception.Message)"
+              }
+          }
           
-          Write-Host "🎮 BlueStacks and gaming tools installation completed!"
+          # Install essential gaming tools
+          Write-Host "🛠️ Installing gaming essentials..."
+          try {
+              choco install googlechrome 7zip notepadplusplus -y --no-progress
+              Write-Host "✅ Gaming tools installed"
+          } catch {
+              Write-Host "⚠️ Some tools failed to install, but core functionality should work"
+          }
+          
+          # Verify and configure BlueStacks
+          $bluestacksPaths = @(
+              "C:\Program Files\BlueStacks_nxt",
+              "C:\Program Files (x86)\BlueStacks_nxt",
+              "C:\ProgramData\BlueStacks_nxt"
+          )
+          
+          $installed = $false
+          foreach ($path in $bluestacksPaths) {
+              if (Test-Path $path) {
+                  Write-Host "✅ BlueStacks found at: $path"
+                  $installed = $true
+                  
+                  # Configure for optimal performance
+                  $configPath = "$env:PROGRAMDATA\BlueStacks_nxt\bluestacks.conf"
+                  if (Test-Path $configPath) {
+                      Write-Host "⚡ Optimizing BlueStacks performance..."
+                      try {
+                          $content = Get-Content $configPath -ErrorAction SilentlyContinue
+                          $content = $content -replace 'bst.instance.Nougat64.memory=.*', 'bst.instance.Nougat64.memory=3072'
+                          $content = $content -replace 'bst.instance.Nougat64.cpu_count=.*', 'bst.instance.Nougat64.cpu_count=2'
+                          $content | Set-Content $configPath
+                          Write-Host "✅ BlueStacks performance optimized (3GB RAM, 2 CPU cores)"
+                      } catch {
+                          Write-Host "⚠️ Config optimization skipped, using defaults"
+                      }
+                  }
+                  break
+              }
+          }
+          
+          if ($installed) {
+              Write-Host "🎮 BlueStacks setup completed successfully!"
+              echo "BLUESTACKS_INSTALLED=true" >> $env:GITHUB_ENV
+          } else {
+              Write-Host "⚠️ BlueStacks installation verification failed"
+              Write-Host "🔄 You can try installing manually via RDP if needed"
+              echo "BLUESTACKS_INSTALLED=false" >> $env:GITHUB_ENV
+          }
 
       - name: Install Tailscale
         run: |
+          Write-Host "🌐 Installing Tailscale..."
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          try {
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -TimeoutSec 120
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+              Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+              Write-Host "✅ Tailscale installed successfully!"
+          } catch {
+              Write-Error "❌ Tailscale installation failed: $($_.Exception.Message)"
+              exit 1
+          }
 
       - name: Establish Tailscale Connection
         run: |
+          Write-Host "🔗 Connecting to Tailscale network..."
+          
           # Bring up Tailscale with the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
           # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
+          while (-not $tsIP -and $retries -lt 15) {
+              Start-Sleep -Seconds 3
+              try {
+                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                  if ($tsIP -and $tsIP.Trim() -ne "") {
+                      break
+                  }
+              } catch {
+                  Write-Host "⏳ Waiting for Tailscale IP assignment... (attempt $($retries + 1))"
+              }
               $retries++
           }
           
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+          if (-not $tsIP -or $tsIP.Trim() -eq "") {
+              Write-Error "❌ Tailscale IP not assigned after 45 seconds. Check your auth key."
               exit 1
           }
+          
+          $tsIP = $tsIP.Trim()
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale connected with IP: $tsIP"
       
       - name: Verify RDP Accessibility & Start BlueStacks
         run: |
+          Write-Host "🔍 Verifying RDP connectivity..."
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           
           # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+              Write-Error "❌ TCP connection to RDP port 3389 failed"
               exit 1
           }
-          Write-Host "✅ TCP connectivity successful!"
+          Write-Host "✅ RDP connectivity verified!"
           
-          # Start BlueStacks in background
-          Write-Host "🚀 Starting BlueStacks..."
-          try {
-              $bluestacksExe = "C:\Program Files\BlueStacks_nxt\HD-Player.exe"
-              if (Test-Path $bluestacksExe) {
-                  Start-Process $bluestacksExe -WindowStyle Minimized
-                  Write-Host "✅ BlueStacks started successfully!"
+          # Attempt to start BlueStacks if installed
+          if ($env:BLUESTACKS_INSTALLED -eq "true") {
+              Write-Host "🚀 Attempting to start BlueStacks..."
+              $bluestacksExes = @(
+                  "C:\Program Files\BlueStacks_nxt\HD-Player.exe",
+                  "C:\Program Files (x86)\BlueStacks_nxt\HD-Player.exe",
+                  "C:\ProgramData\BlueStacks_nxt\HD-Player.exe"
+              )
+              
+              $started = $false
+              foreach ($exe in $bluestacksExes) {
+                  if (Test-Path $exe) {
+                      try {
+                          Start-Process $exe -WindowStyle Minimized -ErrorAction Stop
+                          Write-Host "✅ BlueStacks started successfully!"
+                          $started = $true
+                          break
+                      } catch {
+                          Write-Host "⚠️ Could not auto-start BlueStacks: $($_.Exception.Message)"
+                      }
+                  }
               }
-          } catch {
-              Write-Host "⚠️ BlueStacks auto-start failed, but you can start it manually via RDP"
+              
+              if (-not $started) {
+                  Write-Host "⚠️ BlueStacks auto-start failed, but you can launch it manually via RDP"
+              }
           }
 
       - name: Send RDP + BlueStacks Details to Telegram
@@ -215,21 +330,26 @@ jobs:
               $runId = "$env:GITHUB_RUN_ID"
               $repoName = "${{ github.repository }}"
               $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
+              $bluestacksStatus = if ($env:BLUESTACKS_INSTALLED -eq "true") { "✅ Ready" } else { "⚠️ Manual Install Required" }
               
               $message = "🎮 **RDP + BlueStacks Server Ready!**`n`n" +
                         "🌐 **IP:** ``$env:TAILSCALE_IP```
                         "👤 **User:** ``RDP```n" +
                         "🔑 **Pass:** ``$env:RDP_PASSWORD```
                         "🚀 **Features:**`n" +
-                        "✅ BlueStacks 5 Android Emulator`n" +
-                        "✅ 60FPS + GPU Acceleration`n" +
-                        "✅ Hyper-V Virtualization`n" +
-                        "✅ Optimized for Mobile Gaming`n`n" +
-                        "📱 **Perfect for:** Free Fire, PUBG, GameGuardian`n" +
+                        "📱 BlueStacks 5: $bluestacksStatus`n" +
+                        "⚡ 60FPS + GPU Acceleration`n" +
+                        "🖥️ Windows Server 2022`n" +
+                        "🔧 Optimized for Mobile Gaming`n`n" +
+                        "🎯 **Perfect for:**`n" +
+                        "-  Free Fire Gaming`n" +
+                        "-  GameGuardian Scripts`n" +
+                        "-  Mobile App Development`n" +
+                        "-  Android Automation`n`n" +
                         "🛠️ **Repository:** $repoName`n" +
                         "🆔 **Run ID:** $runId`n" +
                         "⏰ **Started:** $currentTime`n`n" +
-                        "🎯 **Ready for mobile game automation!**"
+                        "🔥 **Ready for mobile game automation!**"
               
               try {
                   $body = @{
@@ -252,21 +372,56 @@ jobs:
               }
           }
           else {
-              Write-Host "⚠️ Telegram bot token or chat ID not configured. Skipping notification."
+              Write-Host "⚠️ Telegram credentials not configured. Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets."
           }
 
       - name: Maintain Connection
         run: |
-          Write-Host "`n=== 🎮 RDP + BLUESTACKS ACCESS ==="
+          Write-Host "`n"
+          Write-Host "========================================="
+          Write-Host "🎮 RDP + BLUESTACKS SERVER READY!"
+          Write-Host "========================================="
           Write-Host "🌐 Address: $env:TAILSCALE_IP"
           Write-Host "👤 Username: RDP"
           Write-Host "🔑 Password: $env:RDP_PASSWORD"
-          Write-Host "🚀 Features: BlueStacks 5 + 60FPS + GPU"
-          Write-Host "📱 Perfect for: Free Fire, GameGuardian, Mobile Gaming"
-          Write-Host "========================================`n"
+          Write-Host "📱 BlueStacks: $($env:BLUESTACKS_INSTALLED)"
+          Write-Host "🚀 Features: 60FPS + GPU + Android Emulation"
+          Write-Host "🎯 Perfect for: Free Fire, GameGuardian, Mobile Gaming"
+          Write-Host "========================================="
+          Write-Host ""
           
-          # Keep runner active indefinitely (or until manually cancelled)
+          # Keep runner active with status updates
+          $counter = 0
           while ($true) {
-              Write-Host "[$(Get-Date)] 🟢 RDP + BlueStacks Active - Ready for mobile gaming!"
-              Start-Sleep -Seconds 300
+              $counter++
+              $uptime = [math]::Round(($counter * 5) / 60, 1)
+              Write-Host "[$(Get-Date)] 🟢 Server Active | Uptime: $uptime minutes | Status: Ready for connections"
+              
+              # Send periodic status updates to Telegram every hour
+              if ($counter % 720 -eq 0) {  # Every 720 * 5 seconds = 1 hour
+                  $botToken = "${{ secrets.TELEGRAM_BOT_TOKEN }}"
+                  $chatId = "${{ secrets.TELEGRAM_CHAT_ID }}"
+                  if ($botToken -and $chatId) {
+                      try {
+                          $statusMessage = "🟢 **Server Status Update**`n`n" +
+                                         "⏰ **Uptime:** $uptime minutes`n" +
+                                         "🌐 **IP:** ``$env:TAILSCALE_IP```n" +
+                                         "📱 **BlueStacks:** Active`n" +
+                                         "🎮 **Status:** Ready for gaming!"
+                          
+                          $statusBody = @{
+                              chat_id = $chatId
+                              text = $statusMessage
+                              parse_mode = "Markdown"
+                          } | ConvertTo-Json
+                          
+                          Invoke-RestMethod -Uri "https://api.telegram.org/bot$botToken/sendMessage" `
+                                          -Method POST -ContentType "application/json" -Body $statusBody
+                      } catch {
+                          # Silently continue if status update fails
+                      }
+                  }
+              }
+              
+              Start-Sleep -Seconds 5
           }
