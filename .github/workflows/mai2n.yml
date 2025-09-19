@@ -1,0 +1,124 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP enabled and firewall opened."
+
+      - name: Optimize RDP Performance
+        run: |
+          New-Item -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Force | Out-Null
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fEnableWinStation" -Value 1 -Force
+          Set-ItemProperty 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Name "fEnableVirtualizedGraphics" -Value 1 -Force
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "ColorDepth" -Value 4 -Force
+          Set-ItemProperty 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Name "MaxCompressionLevel" -Value 0 -Force
+          Set-ItemProperty 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Name "AVC444ModePreferred" -Value 1 -Force
+          Set-ItemProperty 'HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services' -Name "AVCHardwareEncodePreferred" -Value 1 -Force
+          Write-Host "RDP performance tuned."
+
+      - name: Create RDP User
+        run: |
+          Add-Type -AssemblyName System.Security
+          $U=[char[]](65..90);$L=[char[]](97..122);$N=[char[]](48..57);$S=([char[]](33..47)+[char[]](58..64)+[char[]](91..96)+[char[]](123..126))
+          $raw=@(); $raw += $U|Get-Random -Count 4; $raw += $L|Get-Random -Count 4; $raw += $N|Get-Random -Count 4; $raw += $S|Get-Random -Count 4
+          $password = -join ($raw | Sort-Object {Get-Random})
+          $sec = ConvertTo-SecureString $password -AsPlainText -Force
+          try { New-LocalUser -Name "RDP" -Password $sec -AccountNeverExpires -ErrorAction Stop } catch { Set-LocalUser -Name "RDP" -Password $sec }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "RDP user ready."
+
+      - name: Install Tailscale
+        run: |
+          $url="https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $msi="$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $msi -TimeoutSec 120
+          Start-Process msiexec.exe -ArgumentList "/i","`"$msi`"","/quiet","/norestart" -Wait
+          Remove-Item $msi -Force -ErrorAction SilentlyContinue
+          Write-Host "Tailscale installed."
+        # Tailscale on runners provides private connectivity and supports tags/MagicDNS per docs
+        # ref guidance
+
+      - name: Tailscale Up (Auto-connect + Tags + MagicDNS)
+        run: |
+          $Ts="$env:ProgramFiles\Tailscale\tailscale.exe"
+          $HostName="gh-rdp-$env:GITHUB_RUN_ID"
+          & $Ts down 2>$null
+          & $Ts up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=$HostName `
+            --accept-dns=true `
+            --accept-routes=true `
+            --reset `
+            --timeout=60s `
+            --ssh=false `
+            --advertise-tags=tag:gh-rdp
+          $ip=$null
+          for($i=0;$i -lt 20 -and -not $ip;$i++){ Start-Sleep 3; $ip = & $Ts ip -4 }
+          if(-not $ip){ Write-Error "No Tailscale IP"; exit 1 }
+          $json = & $Ts status --json | ConvertFrom-Json
+          $self = $json.Self.HostName
+          if([string]::IsNullOrWhiteSpace($self)){ $self=$HostName }
+          echo "TAILSCALE_IP=$ip"       >> $env:GITHUB_ENV
+          echo "TAILSCALE_HOST=$self"   >> $env:GITHUB_ENV
+          Write-Host "Tailscale up: $ip ($self)."
+        # Tag-based ACLs and stable hostnames are a recommended pattern for GitHub Actions runners
+        # per Tailscale docs and blog on private connections for runners
+
+      - name: Verify RDP Reachability
+        run: |
+          $t = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if(-not $t.TcpTestSucceeded){ Write-Error "RDP 3389 not reachable"; exit 1 }
+          Write-Host "RDP reachable on $env:TAILSCALE_IP:3389."
+
+      - name: Telegram: RDP Details (ASCII-safe)
+        run: |
+          $bot="${{ secrets.TELEGRAM_BOT_TOKEN }}"; $chat="${{ secrets.TELEGRAM_CHAT_ID }}"
+          if($bot -and $chat){
+            $msg = @"
+RDP Server Ready
+
+Tailscale IP: $env:TAILSCALE_IP
+Tailscale Host: $env:TAILSCALE_HOST
+User: RDP
+Pass: $env:RDP_PASSWORD
+
+How to connect:
+1) Open Tailscale app and ensure you are connected to the same tailnet.
+2) Use Microsoft Remote Desktop to connect to $env:TAILSCALE_IP
+   (or $env:TAILSCALE_HOST if MagicDNS is enabled).
+"@
+            $body = @{ chat_id=$chat; text=$msg } | ConvertTo-Json
+            Invoke-RestMethod -Uri "https://api.telegram.org/bot$bot/sendMessage" -Method POST -ContentType "application/json" -Body $body
+          } else {
+            Write-Host "Telegram secrets missing; skipping."
+          }
+        # Using plain-text avoids PowerShell Unicode parse issues seen earlier
+
+      - name: Keep Session Alive
+        run: |
+          Write-Host "==== ACCESS ===="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Hostname: $env:TAILSCALE_HOST"
+          Write-Host "User: RDP"
+          Write-Host "Pass: $env:RDP_PASSWORD"
+          Write-Host "==============="
+          while($true){
+            Write-Host "[$(Get-Date)] RDP active..."
+            Start-Sleep -Seconds 300
+          }
